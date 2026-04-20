@@ -965,21 +965,35 @@ impl super::SolverImpl for Solver {
                 .intern_version_set(name_id, NamelessMatchSpec::default().into())
         });
 
-        let root_requirements = task.specs.into_iter().flat_map(|spec| {
-            let condition_id = if let Some(condition) = spec.condition.as_ref() {
-                let mut cache = provider.parse_match_spec_cache.borrow_mut();
-                Some(parse_condition(condition, &provider.pool, &mut cache))
-            } else {
-                None
-            };
+        // Pre-resolve each spec's condition id so that a malformed condition
+        // surfaces as a `SolveError::ParseMatchSpecError` rather than
+        // panicking inside the iterator chain below.
+        let specs_with_conditions = task
+            .specs
+            .into_iter()
+            .map(|spec| {
+                let condition_id = match spec.condition.as_ref() {
+                    Some(condition) => {
+                        let mut cache = provider.parse_match_spec_cache.borrow_mut();
+                        Some(parse_condition(condition, &provider.pool, &mut cache)?)
+                    }
+                    None => None,
+                };
+                Ok((spec, condition_id))
+            })
+            .collect::<Result<Vec<_>, ParseMatchSpecError>>()?;
 
-            version_sets_for_match_spec(&provider.pool, spec)
+        let root_requirements =
+            specs_with_conditions
                 .into_iter()
-                .map(move |version_set_id| ConditionalRequirement {
-                    requirement: version_set_id.into(),
-                    condition: condition_id,
-                })
-        });
+                .flat_map(|(spec, condition_id)| {
+                    version_sets_for_match_spec(&provider.pool, spec)
+                        .into_iter()
+                        .map(move |version_set_id| ConditionalRequirement {
+                            requirement: version_set_id.into(),
+                            condition: condition_id,
+                        })
+                });
 
         let all_requirements: Vec<_> = virtual_package_requirements
             .map(ConditionalRequirement::from)
@@ -1054,8 +1068,7 @@ fn parse_match_spec(
         ParseMatchSpecOptions::lenient().with_experimental_conditionals(true),
     )?;
     let condition_id = if let Some(condition) = match_spec.condition.as_ref() {
-        let condition_id = parse_condition(condition, pool, parse_match_spec_cache);
-        Some(condition_id)
+        Some(parse_condition(condition, pool, parse_match_spec_cache)?)
     } else {
         None
     };
@@ -1130,66 +1143,64 @@ pub fn extra_version_set(
     pool.intern_version_set(name_id, SolverMatchSpec::Extra)
 }
 
-/// Parses a condition from a `MatchSpecCondition` and returns the corresponding `ConditionId`.
+/// Parses a condition from a `MatchSpecCondition` and returns the corresponding
+/// `ConditionId`.
+///
+/// Returns `Err(ParseMatchSpecError::InvalidCondition)` instead of panicking
+/// when a `MatchSpec` that appears inside a condition itself carries a nested
+/// condition — the solver has no representation for nested conditions.
 fn parse_condition(
     condition: &MatchSpecCondition,
     pool: &Pool<SolverMatchSpec<'_>, NameType>,
     parse_match_spec_cache: &mut MatchSpecParseCache,
-) -> ConditionId {
+) -> Result<ConditionId, ParseMatchSpecError> {
     match condition {
         MatchSpecCondition::MatchSpec(match_spec) => {
-            // Parse the match spec and intern it
-            let (spec, condition) =
-                parse_match_spec(pool, &match_spec.to_string(), parse_match_spec_cache).unwrap();
-            if let Some(_condition) = condition {
-                panic!("conditions cannot be nested");
+            // Parse the match spec and intern it.
+            let (spec, nested) =
+                parse_match_spec(pool, &match_spec.to_string(), parse_match_spec_cache)?;
+            if nested.is_some() {
+                return Err(ParseMatchSpecError::InvalidCondition(
+                    match_spec.to_string(),
+                    "conditions cannot be nested".to_string(),
+                ));
             }
-            let conditions = spec.into_iter().map(resolvo::Condition::Requirement);
-            // Intern the conditions
-            let condition_ids = conditions
+            // Intern each version-set as a Requirement condition.
+            let condition_ids = spec
                 .into_iter()
-                .map(|c| pool.intern_condition(c))
+                .map(|v| pool.intern_condition(resolvo::Condition::Requirement(v)))
                 .collect_vec();
-            // Create a union of the conditions
-            if condition_ids.is_empty() {
-                panic!("match spec condition must have at least one version set");
-            } else if condition_ids.len() == 1 {
-                condition_ids[0]
-            } else {
-                // Otherwise, create a union of the conditions
-                let mut result = condition_ids[0];
-                for &condition_id in &condition_ids[1..] {
-                    let union_condition = resolvo::Condition::Binary(
-                        resolvo::LogicalOperator::And,
-                        result,
-                        condition_id,
-                    );
-                    result = pool.intern_condition(union_condition);
-                }
-                result
+            // `version_sets_for_match_spec` unconditionally pushes the spec's
+            // main version-set (see the call site in `parse_match_spec`), so
+            // an empty vec here is structurally impossible.
+            let mut iter = condition_ids.into_iter();
+            let mut result = iter
+                .next()
+                .unwrap_or_else(|| unreachable!("version_sets_for_match_spec returned no sets"));
+            for condition_id in iter {
+                let union_condition =
+                    resolvo::Condition::Binary(resolvo::LogicalOperator::And, result, condition_id);
+                result = pool.intern_condition(union_condition);
             }
+            Ok(result)
         }
         MatchSpecCondition::And(left, right) => {
-            let condition_id_lhs = parse_condition(left, pool, parse_match_spec_cache);
-            let condition_id_rhs = parse_condition(right, pool, parse_match_spec_cache);
-            // Intern the AND condition
-            let condition = resolvo::Condition::Binary(
+            let lhs = parse_condition(left, pool, parse_match_spec_cache)?;
+            let rhs = parse_condition(right, pool, parse_match_spec_cache)?;
+            Ok(pool.intern_condition(resolvo::Condition::Binary(
                 resolvo::LogicalOperator::And,
-                condition_id_lhs,
-                condition_id_rhs,
-            );
-            pool.intern_condition(condition)
+                lhs,
+                rhs,
+            )))
         }
         MatchSpecCondition::Or(left, right) => {
-            let condition_id_lhs = parse_condition(left, pool, parse_match_spec_cache);
-            let condition_id_rhs = parse_condition(right, pool, parse_match_spec_cache);
-            // Intern the OR condition
-            let condition = resolvo::Condition::Binary(
+            let lhs = parse_condition(left, pool, parse_match_spec_cache)?;
+            let rhs = parse_condition(right, pool, parse_match_spec_cache)?;
+            Ok(pool.intern_condition(resolvo::Condition::Binary(
                 resolvo::LogicalOperator::Or,
-                condition_id_lhs,
-                condition_id_rhs,
-            );
-            pool.intern_condition(condition)
+                lhs,
+                rhs,
+            )))
         }
     }
 }
