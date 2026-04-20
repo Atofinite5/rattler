@@ -164,6 +164,30 @@ impl SparseRepoData {
         #[cfg(not(windows))]
         let file = std::fs::File::from(fs_err::File::open(path.as_ref())?);
 
+        // SAFETY: `memmap2::Mmap::map` requires that the mapped file is not
+        // concurrently modified by this process or another process while the
+        // mapping is live; violating this is undefined behaviour (SIGBUS or
+        // torn reads).
+        //
+        // We uphold that as follows:
+        //   * `file` is opened read-only and is moved into this function; no
+        //     code in this crate writes to an already-open repodata file.
+        //   * `file` is kept alive for the lifetime of the `Mmap` via the
+        //     self-referential `SparseRepoDataInner::Memmapped` built below,
+        //     so the OS will not drop the backing storage while the mapping
+        //     exists.
+        //   * On Windows the file is opened with `FILE_SHARE_READ | WRITE |
+        //     DELETE` (see the block above) so another process renaming or
+        //     deleting the file does not invalidate the existing mapping.
+        //   * Writers in the repodata gateway use write-then-rename (temp
+        //     file + atomic rename) to publish a new repodata.json, so an
+        //     existing `Mmap` continues to refer to its original inode.
+        //
+        // External processes that bypass these conventions and truncate the
+        // file in place can still cause SIGBUS; that is a system-integrity
+        // violation outside the library's contract, not a latent library
+        // bug. If stricter safety is ever required, switch to `fs::read`
+        // and pay the memory cost of fully buffering large repodata files.
         let memory_map = unsafe { memmap2::Mmap::map(&file) }?;
         Ok(SparseRepoData {
             inner: SparseRepoDataInner::Memmapped(MemmappedSparseRepoDataInner::try_new(
