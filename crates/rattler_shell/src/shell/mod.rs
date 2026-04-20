@@ -321,7 +321,15 @@ impl Shell for Bash {
                     // When cygpath isn't found, join the paths with the posix separator.
                     paths_vec.join(":")
                 }
-                Err(e) => panic!("{e}"),
+                Err(e) => {
+                    // cygpath is present but failed unexpectedly. Prefer graceful
+                    // degradation (same fallback as NotFound) over panicking in a
+                    // library path — a malformed PATH shouldn't crash callers.
+                    tracing::warn!(
+                        "`cygpath` failed to convert PATH, falling back to POSIX separator: {e}"
+                    );
+                    paths_vec.join(":")
+                }
             }
         } else {
             paths_vec.join(":")
@@ -370,7 +378,14 @@ impl Shell for Bash {
                         // case we just ignore any conversion and use the windows path directly.
                         completions_dir.to_string_lossy().to_string()
                     }
-                    Err(e) => panic!("{e}"),
+                    Err(e) => {
+                        // cygpath was found but failed for another reason (e.g. invoke error).
+                        // Degrade the same way as the NotFound branch instead of panicking.
+                        tracing::warn!(
+                            "`cygpath` failed to convert completions path, using native path: {e}"
+                        );
+                        completions_dir.to_string_lossy().to_string()
+                    }
                 }
             } else {
                 completions_dir.to_string_lossy().to_string()
